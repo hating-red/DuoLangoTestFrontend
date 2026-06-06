@@ -52,6 +52,8 @@
 
 <script setup lang="ts">
 const TARGET_SAMPLE_RATE = 16000
+const VOICE_ACTIVITY_THRESHOLD = 0.012
+const AUTO_STOP_SILENCE_MS = 7000
 const TARGET_TEXT = `Приставка ПРИ
 1.Пространственная БЛИЗОСТЬ:
 прибрежный, пригородный, привратник, прилюдно
@@ -89,10 +91,13 @@ const statusKind = ref<'idle' | 'recording' | 'error'>('idle')
 const errorMessage = ref('')
 
 let socket: WebSocket | null = null
+let socketPromise: Promise<WebSocket> | null = null
 let mediaStream: MediaStream | null = null
 let audioContext: AudioContext | null = null
 let sourceNode: MediaStreamAudioSourceNode | null = null
 let processorNode: ScriptProcessorNode | null = null
+let hasStartedStreaming = false
+let lastSpeechAt = 0
 
 const visibleTranscript = computed(() => {
   const finalText = finalSegments.value.join(' ').trim()
@@ -142,11 +147,12 @@ async function startRecording() {
   errorMessage.value = ''
   finalSegments.value = []
   partialTranscript.value = ''
-  statusText.value = 'Подключаемся к бэкенду...'
+  statusText.value = 'Жду речь'
   statusKind.value = 'idle'
+  hasStartedStreaming = false
+  lastSpeechAt = 0
 
   try {
-    socket = await openSpeechSocket()
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
@@ -161,23 +167,14 @@ async function startRecording() {
     processorNode = audioContext.createScriptProcessor(4096, 1, 1)
 
     processorNode.onaudioprocess = (event) => {
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        return
-      }
-
-      const input = event.inputBuffer.getChannelData(0)
-      const pcm = convertFloat32ToPcm16(input, audioContext!.sampleRate, TARGET_SAMPLE_RATE)
-
-      if (pcm.byteLength > 0) {
-        socket.send(pcm)
-      }
+      void processAudioFrame(event.inputBuffer.getChannelData(0))
     }
 
     sourceNode.connect(processorNode)
     processorNode.connect(audioContext.destination)
 
     isRecording.value = true
-    statusText.value = 'Идет запись'
+    statusText.value = 'Жду речь'
     statusKind.value = 'recording'
   } catch (error) {
     errorMessage.value = getErrorMessage(error)
@@ -210,12 +207,82 @@ async function stopRecording() {
     socket.close(1000, 'Recording stopped')
   }
   socket = null
+  socketPromise = null
+  hasStartedStreaming = false
+  lastSpeechAt = 0
 
   isRecording.value = false
   statusText.value = errorMessage.value ? 'Ошибка' : 'Готово к записи'
   statusKind.value = errorMessage.value ? 'error' : 'idle'
   partialTranscript.value = ''
   isBusy.value = false
+}
+
+async function processAudioFrame(input: Float32Array) {
+  if (!isRecording.value || !audioContext) {
+    return
+  }
+
+  const volume = getRmsVolume(input)
+  const now = performance.now()
+
+  if (volume < VOICE_ACTIVITY_THRESHOLD) {
+    if (hasStartedStreaming && now - lastSpeechAt > AUTO_STOP_SILENCE_MS) {
+      statusText.value = 'Остановлено по тишине'
+      await stopRecording()
+    }
+
+    return
+  }
+
+  lastSpeechAt = now
+
+  const pcm = convertFloat32ToPcm16(input, audioContext.sampleRate, TARGET_SAMPLE_RATE)
+  if (pcm.byteLength === 0) {
+    return
+  }
+
+  try {
+    const ws = await ensureSpeechSocket()
+
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(pcm)
+    }
+  } catch (error) {
+    errorMessage.value = getErrorMessage(error)
+    statusText.value = 'Ошибка соединения'
+    statusKind.value = 'error'
+    await stopRecording()
+  }
+}
+
+async function ensureSpeechSocket() {
+  if (socket?.readyState === WebSocket.OPEN) {
+    return socket
+  }
+
+  if (!socketPromise) {
+    statusText.value = 'Подключаемся к бэкенду...'
+    socketPromise = openSpeechSocket()
+      .then((ws) => {
+        if (!isRecording.value) {
+          ws.close(1000, 'Recording stopped before speech stream opened')
+          return ws
+        }
+
+        socket = ws
+        hasStartedStreaming = true
+        statusText.value = 'Идет запись'
+        statusKind.value = 'recording'
+
+        return ws
+      })
+      .finally(() => {
+        socketPromise = null
+      })
+  }
+
+  return socketPromise
 }
 
 function openSpeechSocket(): Promise<WebSocket> {
@@ -341,6 +408,16 @@ function resampleLinear(
   }
 
   return output
+}
+
+function getRmsVolume(input: Float32Array) {
+  let sum = 0
+
+  for (let i = 0; i < input.length; i += 1) {
+    sum += input[i] * input[i]
+  }
+
+  return Math.sqrt(sum / input.length)
 }
 
 function getErrorMessage(error: unknown) {
